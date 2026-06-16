@@ -300,6 +300,8 @@ void wifi_wait_for_socket_connected() {
   if (clientConnection < 0) {
     ESP_LOGE(TAG, "Unable to accept connection: errno %d", errno);
   } else {
+     struct timeval snd_to = {.tv_sec = 1, .tv_usec = 0};
+     setsockopt(clientConnection, SOL_SOCKET, SO_SNDTIMEO, &snd_to, sizeof(snd_to));
      ESP_LOGI(TAG, "Connection accepted");
   }
 }
@@ -441,7 +443,9 @@ static void wifi_receiving_task(void *pvParameters) {
 
 void wifi_transport_send(const CPXRoutablePacket_t* packet) {
   assert(packet->dataLength <= WIFI_TRANSPORT_MTU - CPX_ROUTING_PACKED_SIZE);
-  xQueueSend(wifiTxQueue, packet, portMAX_DELAY);
+  if (xQueueSend(wifiTxQueue, packet, 0) != pdTRUE) {
+		// client gone or slow: discard video frame chunk
+  }
 }
 
 void wifi_transport_receive(CPXRoutablePacket_t* packet) {
