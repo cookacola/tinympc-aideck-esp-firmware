@@ -326,12 +326,13 @@ void wifi_wait_for_socket_connected() {
   if (clientConnection < 0) {
     ESP_LOGE(TAG, "Unable to accept connection: errno %d", errno);
   } else {
-     // Bound a blocking send() so a half-dead client can't wedge the sender
-     // forever. 2s (not 300ms): normal SoftAP WiFi MAC-layer latency spikes
-     // under a steady ~7fps stream regularly exceed 300ms, and a too-tight
-     // timeout kills healthy connections ~1x/s. TCP keepalive (~3s below) is
-     // the real dead-client detector; this is just the anti-wedge backstop.
-     struct timeval snd_to = {.tv_sec = 2, .tv_usec = 0};
+     // Bound a blocking send() to 200ms so we SHED a stale frame fast when the
+     // viewer falls behind, instead of letting 2s of data pile up. For a live
+     // stream dropping the latest frame is correct; deep-buffering is what let
+     // the connection choke and abort (errno 11 then errno 113 every ~5s). Safe
+     // to be this short only because wifi_send_packet no longer closes on
+     // EAGAIN -- it just drops the frame and keeps streaming.
+     struct timeval snd_to = {.tv_sec = 0, .tv_usec = 200000};
      setsockopt(clientConnection, SOL_SOCKET, SO_SNDTIMEO, &snd_to, sizeof(snd_to));
 
      // Abortive close (RST) instead of a graceful FIN: when we close a dead
@@ -341,8 +342,11 @@ void wifi_wait_for_socket_connected() {
      setsockopt(clientConnection, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(so_linger));
 
      // Actively probe the peer so a vanished client is detected even when the
-     // TCP send buffer has not yet filled.
-     int ka = 1, idle = 1, intvl = 1, cnt = 2;
+     // TCP send buffer has not yet filled. Relaxed from 1s/1s/2 (~3s): that was
+     // aggressive enough to abort a healthy connection during a multi-second
+     // viewer render-freeze. 5s idle / 2s intvl / 3 probes => ~11s to declare a
+     // silently-gone client dead, which is fine here.
+     int ka = 1, idle = 5, intvl = 2, cnt = 3;
      setsockopt(clientConnection, SOL_SOCKET,  SO_KEEPALIVE,  &ka,    sizeof(ka));
      setsockopt(clientConnection, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
      setsockopt(clientConnection, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
@@ -435,9 +439,18 @@ void wifi_send_packet(const char * buffer, size_t size) {
     xEventGroupSetBits(s_wifi_event_group, WIFI_PACKET_SENDING);
     int err = send(clientConnection, buffer, size, 0);
     if (err < 0) {
-      ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
-      close_client_socket();
-
+      // EAGAIN/EWOULDBLOCK == the SO_SNDTIMEO fired: the client is just slow
+      // (e.g. a laggy viewer that stalled on rendering), not gone. Drop this
+      // frame and keep streaming -- tearing down the socket only causes a
+      // reconnect freeze. A genuinely dead client still gets closed: either a
+      // hard send error here (ECONNRESET/EPIPE/EHOSTUNREACH) or TCP keepalive
+      // (~3s) catches it.
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        ESP_LOGW(TAG, "send() timed out (errno %d); dropping frame, keeping connection", errno);
+      } else {
+        ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
+        close_client_socket();
+      }
     }
     xEventGroupSetBits(s_wifi_event_group, WIFI_PACKET_WAIT_SEND);
   }
