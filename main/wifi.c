@@ -71,6 +71,14 @@ static EventGroupHandle_t startUpEventGroup;
 
 #define NO_CONNECTION -1
 #define WIFI_HOST_QUEUE_LENGTH (2)
+// The TX queue must absorb a full image frame's burst of CPX chunks (~15-18 for a
+// 15 KB JPEG), which the GAP8 pushes over SPI far faster than the socket drains.
+// A 2-deep queue dropped mid-frame chunks -> truncated JPEGs on the viewer.
+#define WIFI_TX_QUEUE_LENGTH (24)
+// How long wifi_transport_send will wait for queue space before dropping a chunk.
+// Lossless within a frame for a healthy client; bounded so a dead/stuck client
+// can't wedge the router (the socket send() is itself bounded by SO_SNDTIMEO).
+#define WIFI_TX_ENQUEUE_TIMEOUT_MS (50)
 
 static xQueueHandle wifiRxQueue;
 static xQueueHandle wifiTxQueue;
@@ -175,7 +183,11 @@ static void wifi_init_softap(const char *ssid, const char* key)
   wifi_config_t wifi_config = {
       .ap = {
           .ssid_len = strlen(ssid),
-          .max_connection = 1,
+          // Allow several associations so a reconnecting client can join a free
+          // slot immediately instead of waiting for the previous (stale)
+          // station to age out of the AP's table. We still only serve one TCP
+          // client at a time at the socket layer.
+          .max_connection = 4,
           .authmode = WIFI_AUTH_OPEN},
   };
   strncpy((char *)wifi_config.ap.ssid, ssid, strlen(ssid));
@@ -255,11 +267,22 @@ static void wifi_ctrl(void* _param) {
   }
 }
 
+static portMUX_TYPE closeMux = portMUX_INITIALIZER_UNLOCKED;
 static void close_client_socket()
 {
-    close(clientConnection);
+    // Both the sending and receiving tasks can detect a disconnect, so claim
+    // the fd atomically: only the first caller closes it and signals, which
+    // also prevents closing a freshly accepted (reused) fd.
+    int fd;
+    taskENTER_CRITICAL(&closeMux);
+    fd = clientConnection;
     clientConnection = NO_CONNECTION;
-    xEventGroupSetBits(s_wifi_event_group, WIFI_SOCKET_DISCONNECTED);
+    taskEXIT_CRITICAL(&closeMux);
+
+    if (fd != NO_CONNECTION) {
+        close(fd);
+        xEventGroupSetBits(s_wifi_event_group, WIFI_SOCKET_DISCONNECTED);
+    }
 }
 
 void wifi_bind_socket() {
@@ -285,7 +308,10 @@ void wifi_bind_socket() {
   }
   ESP_LOGD(TAG, "Socket binded");
 
-  err = listen(serverSock, 1);
+  // Backlog of 2 lets a reconnecting client's TCP handshake complete while the
+  // previous (dead) connection is still being torn down, so it is accepted
+  // immediately instead of having to retry.
+  err = listen(serverSock, 2);
   if (err != 0) {
     ESP_LOGE(TAG, "Error occured during listen: errno %d", errno);
   }
@@ -300,9 +326,28 @@ void wifi_wait_for_socket_connected() {
   if (clientConnection < 0) {
     ESP_LOGE(TAG, "Unable to accept connection: errno %d", errno);
   } else {
-     struct timeval snd_to = {.tv_sec = 1, .tv_usec = 0};
+     // Bound a blocking send() so a half-dead client can't wedge the sender
+     // forever. 2s (not 300ms): normal SoftAP WiFi MAC-layer latency spikes
+     // under a steady ~7fps stream regularly exceed 300ms, and a too-tight
+     // timeout kills healthy connections ~1x/s. TCP keepalive (~3s below) is
+     // the real dead-client detector; this is just the anti-wedge backstop.
+     struct timeval snd_to = {.tv_sec = 2, .tv_usec = 0};
      setsockopt(clientConnection, SOL_SOCKET, SO_SNDTIMEO, &snd_to, sizeof(snd_to));
-     ESP_LOGI(TAG, "Connection accepted");
+
+     // Abortive close (RST) instead of a graceful FIN: when we close a dead
+     // client, free the TCP state immediately so it never lingers in TIME_WAIT
+     // (60s MSL) and block a reconnect that reuses the same 4-tuple.
+     struct linger so_linger = {.l_onoff = 1, .l_linger = 0};
+     setsockopt(clientConnection, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(so_linger));
+
+     // Actively probe the peer so a vanished client is detected even when the
+     // TCP send buffer has not yet filled.
+     int ka = 1, idle = 1, intvl = 1, cnt = 2;
+     setsockopt(clientConnection, SOL_SOCKET,  SO_KEEPALIVE,  &ka,    sizeof(ka));
+     setsockopt(clientConnection, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
+     setsockopt(clientConnection, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+     setsockopt(clientConnection, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
+     ESP_LOGI(TAG, "Connection accepted (fd=%d)", clientConnection);
   }
 }
 
@@ -443,8 +488,10 @@ static void wifi_receiving_task(void *pvParameters) {
 
 void wifi_transport_send(const CPXRoutablePacket_t* packet) {
   assert(packet->dataLength <= WIFI_TRANSPORT_MTU - CPX_ROUTING_PACKED_SIZE);
-  if (xQueueSend(wifiTxQueue, packet, 0) != pdTRUE) {
-		// client gone or slow: discard video frame chunk
+  if (xQueueSend(wifiTxQueue, packet, pdMS_TO_TICKS(WIFI_TX_ENQUEUE_TIMEOUT_MS)) != pdTRUE) {
+		// client gone or stuck past the bounded wait: discard this chunk rather
+		// than wedge the router. SO_SNDTIMEO bounds the downstream send(), so the
+		// queue always drains and this can't block the SPI path indefinitely.
   }
 }
 
@@ -466,7 +513,7 @@ void wifi_init() {
   s_wifi_event_group = xEventGroupCreate();
 
   wifiRxQueue = xQueueCreate(WIFI_HOST_QUEUE_LENGTH, sizeof(WifiTransportPacket_t));
-  wifiTxQueue = xQueueCreate(WIFI_HOST_QUEUE_LENGTH, sizeof(CPXRoutablePacket_t));
+  wifiTxQueue = xQueueCreate(WIFI_TX_QUEUE_LENGTH, sizeof(CPXRoutablePacket_t));
 
   startUpEventGroup = xEventGroupCreate();
   xEventGroupClearBits(startUpEventGroup, START_UP_MAIN_TASK | START_UP_RX_TASK | START_UP_TX_TASK | START_UP_CTRL_TASK);
